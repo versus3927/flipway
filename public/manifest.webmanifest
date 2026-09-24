@@ -1,0 +1,13 @@
+{
+  "name": "ГРАВИ-РАН 3D",
+  "short_name": "ГРАВИ-РАН",
+  "description": "Бесконечный 3D-раннер: бегай по полу и потолку, уворачивайся от поездов и драконов.",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#04060d",
+  "theme_color": "#04060d",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
