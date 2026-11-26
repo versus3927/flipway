@@ -14,44 +14,14 @@ export interface BybitItem {
   finishedNum?: number;
   recentOrderNum?: string;
   recentExecuteRate?: string;
-  payments: string[]; // payment names
+  payments: string[];
   paymentsDetailed?: { name: string; id: string }[];
   remark: string;
   currencyId: string;
   tokenId: string;
   side: number;
   authStatus?: string;
-  // raw
   [k: string]: any;
-}
-
-const PAYMENT_MAP_RUB: Record<string, string> = {
-  "14": "Bank Transfer",
-  "585": "Sberbank",
-  "614": "Tinkoff",
-  "75": "SBPay",
-  "62": "Raiffeisen",
-};
-
-async function fetchWithFallback(url: string, init: RequestInit): Promise<Response> {
-  // 1) try direct
-  try {
-    const r = await fetch(url, init);
-    if (r.ok) return r;
-    // if not ok, try proxy
-    throw new Error(`HTTP ${r.status}`);
-  } catch (e) {
-    // 2) try corsproxy.io
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-    try {
-      const r2 = await fetch(proxyUrl, init);
-      if (r2.ok) return r2;
-    } catch {}
-    // 3) try allorigins
-    const aoUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-    const r3 = await fetch(aoUrl, init);
-    return r3;
-  }
 }
 
 function normalizeItem(raw: any): BybitItem | null {
@@ -62,15 +32,12 @@ function normalizeItem(raw: any): BybitItem | null {
     else if (Array.isArray(raw.paymentsName)) payments.push(...raw.paymentsName);
     else if (typeof raw.payments === "string") payments.push(raw.payments);
 
-    // alternative fields
     if (raw.paymentsDetail) {
       for (const p of raw.paymentsDetail) {
         if (p.paymentName) payments.push(p.paymentName);
         if (p.paymentType) payments.push(p.paymentType);
       }
     }
-
-    // paymentVoList is common
     if (Array.isArray(raw.paymentVoList)) {
       for (const p of raw.paymentVoList) {
         if (p.paymentName) payments.push(p.paymentName);
@@ -106,6 +73,29 @@ function normalizeItem(raw: any): BybitItem | null {
   }
 }
 
+async function fetchViaServer(payload: any): Promise<any> {
+  const r = await fetch("/api/bybit/p2p", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Server proxy ${r.status}: ${t.slice(0, 300)}`);
+  }
+  return r.json();
+}
+
+async function fetchDirect(payload: any, url: string): Promise<any> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
 export async function fetchBybitP2P(options: {
   amount: string;
   tokenId?: string;
@@ -116,161 +106,80 @@ export async function fetchBybitP2P(options: {
 }): Promise<{ items: BybitItem[]; rawCount: number; debug: string[] }> {
   const tokenId = options.tokenId || "USDT";
   const currencyId = options.currencyId || "RUB";
-  const side = options.side ?? 0; // 0 = buy USDT (sell ads)
+  const side = options.side ?? 0;
   const pageSize = options.pageSize ?? 20;
   const maxPages = options.maxPages ?? 5;
 
   const debug: string[] = [];
   const allItems: BybitItem[] = [];
 
-  // Try endpoints in priority order
-  const endpoints = [
-    {
-      url: "https://api2.bybit.com/fiat/otc/item/online",
-      body: (page: number) => ({
-        userId: "",
-        tokenId,
-        currencyId,
-        payment: [],
-        side: String(side),
-        size: String(pageSize),
-        page: String(page),
-        amount: options.amount,
-        authMaker: false,
-        canTrade: false,
-      }),
-    },
-    {
-      url: "https://www.bybit.com/x-api/fiat/otc/item/list",
-      body: (page: number) => ({
-        tokenId,
-        currencyId,
-        payment: [],
-        side,
-        size: pageSize,
-        page,
-        amount: options.amount,
-      }),
-    },
-  ];
+  for (let page = 1; page <= maxPages; page++) {
+    const payload = {
+      userId: "",
+      tokenId,
+      currencyId,
+      payment: [],
+      side: String(side),
+      size: String(pageSize),
+      page: String(page),
+      amount: options.amount,
+      authMaker: false,
+      canTrade: false,
+    };
 
-  // For dev proxy, rewrite urls
-  const isLocalhost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-  const proxiedEndpoints = endpoints.map((e) => {
-    if (isLocalhost) {
-      if (e.url.includes("api2.bybit.com")) return { ...e, url: "/bybit-api/fiat/otc/item/online" };
-      if (e.url.includes("www.bybit.com")) return { ...e, url: "/bybit-x-api/fiat/otc/item/list" };
-    }
-    return e;
-  });
+    let json: any = null;
+    let success = false;
 
-  let successEndpoint: typeof endpoints[0] | null = null;
-
-  for (const ep of proxiedEndpoints) {
-    debug.push(`пробую ${ep.url}`);
-    let endpointWorked = false;
-    for (let page = 1; page <= maxPages; page++) {
-      const body = ep.body(page);
+    // 1) Try server proxy (works on Railway)
+    try {
+      debug.push(`стр ${page}: через сервер /api/bybit/p2p`);
+      json = await fetchViaServer(payload);
+      success = true;
+      debug.push(`  -> сервер OK`);
+    } catch (e: any) {
+      debug.push(`  -> сервер ошибка: ${e.message}`);
+      // 2) Try vite dev proxy (local)
       try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          lang: "ru",
-          platform: "PC",
-          origin: "https://www.bybit.com",
-          Referer: "https://www.bybit.com/",
-        };
-        // For direct browser fetch we need to avoid forbidden headers, so filter
-        const safeHeaders: Record<string, string> = {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        };
-        const useHeaders = ep.url.startsWith("/") ? headers : safeHeaders;
-
-        const resp = await fetch(ep.url, {
-          method: "POST",
-          headers: useHeaders,
-          body: JSON.stringify(body),
-        });
-
-        if (!resp.ok) {
-          debug.push(`  стр ${page}: HTTP ${resp.status}`);
-          // try fallback proxy
-          const proxyResp = await fetchWithFallback(ep.url, {
-            method: "POST",
-            headers: safeHeaders,
-            body: JSON.stringify(body),
-          });
-          if (!proxyResp.ok) {
-            debug.push(`  стр ${page} proxy: HTTP ${proxyResp.status}`);
-            continue;
-          }
-          const j = await proxyResp.json();
-          const items = j?.result?.items ?? j?.result?.list ?? j?.data?.items ?? j?.items ?? [];
-          if (items.length === 0) {
-            debug.push(`  стр ${page} proxy: 0 объявлений`);
-            break;
-          }
-          endpointWorked = true;
-          successEndpoint = ep;
-          for (const raw of items) {
-            const n = normalizeItem(raw);
-            if (n) allItems.push(n);
-          }
-          debug.push(`  стр ${page} proxy: ${items.length} шт`);
-          if (items.length < pageSize) break;
+        const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname.includes("e2b.app"));
+        if (isLocal) {
+          debug.push(`  пробую /bybit-api/fiat/otc/item/online (vite proxy)`);
+          json = await fetchDirect(payload, "/bybit-api/fiat/otc/item/online");
+          success = true;
+        } else throw new Error("not local");
+      } catch (e2: any) {
+        // 3) Try direct + public cors proxy as last resort
+        try {
+          debug.push(`  пробую прямой api2.bybit.com`);
+          json = await fetchDirect(payload, "https://api2.bybit.com/fiat/otc/item/online");
+          success = true;
+        } catch (e3: any) {
+          debug.push(`  -> все методы не сработали: ${e3.message}`);
           continue;
         }
-
-        const json = await resp.json();
-        const items = json?.result?.items ?? json?.result?.list ?? json?.data?.items ?? json?.data ?? json?.items ?? [];
-        if (!Array.isArray(items)) {
-          debug.push(`  стр ${page}: неожиданный формат ${JSON.stringify(json).slice(0,200)}`);
-          break;
-        }
-        if (items.length === 0) {
-          debug.push(`  стр ${page}: 0 объявлений — конец`);
-          endpointWorked = true;
-          break;
-        }
-        endpointWorked = true;
-        successEndpoint = ep;
-        for (const raw of items) {
-          const n = normalizeItem(raw);
-          if (n) allItems.push(n);
-        }
-        debug.push(`  стр ${page}: ${items.length} шт, цена от ${items[0]?.price}`);
-        if (items.length < pageSize) break;
-      } catch (err: any) {
-        debug.push(`  стр ${page}: ошибка ${err?.message || err}`);
-        // try via proxy
-        try {
-          const proxyResp2 = await fetchWithFallback(ep.url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          });
-          const j = await proxyResp2.json();
-          const items = j?.result?.items ?? j?.result?.list ?? [];
-          if (items.length > 0) {
-            endpointWorked = true;
-            successEndpoint = ep;
-            for (const raw of items) allItems.push(normalizeItem(raw)!);
-            debug.push(`  стр ${page} fallback proxy: ${items.length} шт`);
-            if (items.length < pageSize) break;
-            continue;
-          }
-        } catch {}
-        break;
       }
     }
-    if (endpointWorked && allItems.length > 0) break;
-    // try next endpoint
+
+    if (!success || !json) continue;
+
+    const items = json?.result?.items ?? json?.result?.list ?? json?.data?.items ?? json?.data ?? json?.items ?? [];
+    if (!Array.isArray(items)) {
+      debug.push(`  неожиданный формат: ${JSON.stringify(json).slice(0, 200)}`);
+      break;
+    }
+    if (items.length === 0) {
+      debug.push(`  стр ${page}: 0 объявлений — конец`);
+      break;
+    }
+    for (const raw of items) {
+      const n = normalizeItem(raw);
+      if (n) allItems.push(n);
+    }
+    debug.push(`  стр ${page}: ${items.length} шт, цена от ${items[0]?.price}`);
+    if (items.length < pageSize) break;
   }
 
-  // If still 0, try demo data for preview (so UI works even if Bybit blocked)
   if (allItems.length === 0) {
-    debug.push("Bybit API не ответил — проверь сеть / CORS. Попробуй VPN или прокси.");
+    debug.push("Ничего не нашли — проверь доступность Bybit.");
   }
 
   return { items: allItems, rawCount: allItems.length, debug };
@@ -285,11 +194,5 @@ export function formatAmount(v: string | number) {
 export function isBankTransfer(payments: string[]): boolean {
   if (!payments || payments.length === 0) return false;
   const joined = payments.join(" ").toLowerCase();
-  return (
-    joined.includes("bank") ||
-    joined.includes("банк") ||
-    joined.includes("перевод") ||
-    joined.includes("bank transfer") ||
-    payments.some((p) => p.toLowerCase().includes("bank"))
-  );
+  return joined.includes("bank") || joined.includes("банк") || joined.includes("перевод") || payments.some((p) => p.toLowerCase().includes("bank"));
 }
