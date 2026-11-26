@@ -1,322 +1,519 @@
-import { useEffect, useRef, useState } from 'react';
-import { Game, HudData } from './game/Game';
-import { LOCS, LocId, css } from './game/config';
+import { useState, useMemo } from "react";
+import { fetchBybitP2P, formatAmount, isBankTransfer, type BybitItem } from "./lib/bybit";
+import { checkDescription } from "./lib/filters";
 import {
-  Play, RotateCcw, Pause, Volume2, VolumeX, Coins, Gauge, Trophy,
-  MoveHorizontal, ArrowUpDown, TrainFront, AlertTriangle, Building2,
-  Mountain, Snowflake, Dog, Castle, Flame, Home, ChevronRight,
-} from 'lucide-react';
+  Search,
+  ExternalLink,
+  Filter,
+  ArrowUpDown,
+  BadgeCheck,
+  User,
+  Wallet,
+  MessageSquareText,
+  AlertTriangle,
+  CheckCircle2,
+  Sparkles,
+  RefreshCw,
+  Banknote,
+  ShieldCheck,
+  Timer,
+  Copy,
+  ChevronDown,
+  Info,
+} from "lucide-react";
 
-const LOC_ICONS: Record<LocId, typeof Building2> = {
-  metro: Building2, canyon: Mountain, ice: Snowflake, pugs: Dog, castle: Castle,
+type ResultItem = BybitItem & {
+  filter: ReturnType<typeof checkDescription>;
+  priceNum: number;
+  minNum: number;
+  maxNum: number;
 };
 
-interface Banner { t: string; s: string; c: string; key: number; }
-interface Results { dist: number; coins: number; score: number; best: number; isRecord: boolean; }
-
 export default function App() {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const gameRef = useRef<Game | null>(null);
-  const [hud, setHud] = useState<HudData>({ dist: 0, coins: 0, speed: 0, best: 0 });
-  const [state, setState] = useState<'menu' | 'play' | 'dead'>('menu');
-  const [banner, setBanner] = useState<Banner | null>(null);
-  const [warn, setWarn] = useState<{ kind: 'train' | 'dragon'; key: number } | null>(null);
-  const [loc, setLoc] = useState<LocId>('metro');
-  const [paused, setPaused] = useState(false);
-  const [muted, setMuted] = useState(() => localStorage.getItem('gr_mute') === '1');
-  const [results, setResults] = useState<Results | null>(null);
+  const [amount, setAmount] = useState("5000");
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState<ResultItem[]>([]);
+  const [rawCount, setRawCount] = useState(0);
+  const [debug, setDebug] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!mountRef.current) return;
-    const game = new Game(mountRef.current, {
-      hud: (d) => setHud(d),
-      banner: (t, s, c) => setBanner({ t, s, c, key: Date.now() + Math.random() }),
-      state: (s) => setState(s),
-      warn: (kind) => setWarn(kind ? { kind, key: Date.now() } : null),
-      loc: (l) => setLoc(l),
-      over: (r) => setResults(r),
-      pauseChange: (p) => setPaused(p),
-    });
-    gameRef.current = game;
-    game.setMuted(localStorage.getItem('gr_mute') === '1');
-    const onVis = () => { if (document.hidden) game.pauseIfPlaying(); };
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      document.removeEventListener('visibilitychange', onVis);
-      game.dispose();
-      gameRef.current = null;
+  const stats = useMemo(() => {
+    if (!results.length) return null;
+    const prices = results.map((r) => r.priceNum);
+    return {
+      min: Math.min(...prices),
+      max: Math.max(...prices),
+      avg: prices.reduce((a, b) => a + b, 0) / prices.length,
     };
-  }, []);
+  }, [results]);
 
-  // автоскрытие баннера и предупреждения
-  useEffect(() => {
-    if (!banner) return;
-    const id = setTimeout(() => setBanner(null), 2900);
-    return () => clearTimeout(id);
-  }, [banner]);
-  useEffect(() => {
-    if (!warn) return;
-    const id = setTimeout(() => setWarn(null), 2600);
-    return () => clearTimeout(id);
-  }, [warn]);
+  const doSearch = async () => {
+    setLoading(true);
+    setError(null);
+    setResults([]);
+    setDebug([]);
+    setRawCount(0);
+    try {
+      const amt = amount.replace(/\s/g, "") || "5000";
+      const { items, rawCount: rc, debug: dbg } = await fetchBybitP2P({
+        amount: amt,
+        tokenId: "USDT",
+        currencyId: "RUB",
+        side: 0, // покупаем USDT
+        pageSize: 20,
+        maxPages: 5,
+      });
+      setRawCount(rc);
+      setDebug(dbg);
 
-  const start = () => { setResults(null); gameRef.current?.start(); };
-  const toMenu = () => { setResults(null); gameRef.current?.toMenu(); };
-  const toggleMute = () => {
-    const m = !muted;
-    setMuted(m);
-    localStorage.setItem('gr_mute', m ? '1' : '0');
-    gameRef.current?.setMuted(m);
+      if (items.length === 0) {
+        setError(
+          "Bybit не вернул объявления. Это бывает из-за блокировки CORS в браузере. Попробуй: 1) включить VPN, 2) открыть через dev-прокси (npm run dev), 3) проверить что Bybit P2P доступен в твоей стране. Логи ниже в отладке."
+        );
+        return;
+      }
+
+      // Фильтр 1: Bank Transfer + лимит от 5к
+      const wantedMin = parseInt(amt.replace(/\D/g, ""), 10);
+
+      const filtered: ResultItem[] = [];
+
+      for (const it of items) {
+        const priceNum = parseFloat(it.price);
+        const minNum = parseFloat(String(it.minAmount).replace(/,/g, ""));
+        const maxNum = parseFloat(String(it.maxAmount).replace(/,/g, ""));
+
+        // оплата
+        const hasBank = isBankTransfer(it.payments);
+        if (!hasBank) continue;
+
+        // лимит именно от 5к: minAmount == wantedMin
+        // допускаем небольшую погрешность 0.01, но требуем точное совпадение
+        if (Math.abs(minNum - wantedMin) > 0.5) continue;
+
+        // описание фильтр
+        const filter = checkDescription(it.remark);
+        if (!filter.allowed) continue;
+
+        filtered.push({
+          ...it,
+          filter,
+          priceNum,
+          minNum,
+          maxNum,
+        });
+      }
+
+      // сортировка по цене от меньшей к большей
+      filtered.sort((a, b) => a.priceNum - b.priceNum);
+
+      setResults(filtered);
+      if (filtered.length === 0) {
+        setError(
+          `Нашлось ${rc} объявлений Bank Transfer, но после фильтров (ровно от ${formatAmount(amt)} RUB и «принимает от 3 лиц») ничего не осталось. Попробуй снять часть фильтров или проверить другой способ оплаты.`
+        );
+      }
+    } catch (e: any) {
+      setError(e?.message || "Ошибка запроса");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const LocIcon = LOC_ICONS[loc];
-  const locCfg = LOCS[loc];
+  const copyLink = async (it: ResultItem) => {
+    const url = `https://www.bybit.com/fiat/trade/otc/maker/${it.userId}?actionType=0&token=USDT&fiat=RUB&amount=${amount}`;
+    await navigator.clipboard.writeText(url);
+    setCopiedId(it.id);
+    setTimeout(() => setCopiedId(null), 1800);
+  };
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#04060d]">
-      {/* 3D сцена */}
-      <div ref={mountRef} className="absolute inset-0" />
+    <div className="min-h-screen bg-[#080a12] text-white selection:bg-[#2dd4bf]/30">
+      {/* BG glow */}
+      <div className="fixed inset-0 pointer-events-none">
+        <div className="absolute -top-[30%] left-1/2 -translate-x-1/2 w-[120%] h-[70%] bg-[radial-gradient(ellipse_at_center,_rgba(45,212,191,0.14),transparent_65%)]" />
+        <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-cyan-400/30 to-transparent" />
+      </div>
 
-      {/* виньетка + сканлайны */}
-      <div className="pointer-events-none absolute inset-0 vignette" />
-      <div className="pointer-events-none absolute inset-0 scanlines opacity-60" />
-
-      {/* ═══ HUD во время игры ═══ */}
-      {state === 'play' && (
-        <>
-          <div className="pointer-events-none absolute left-3 top-3 flex flex-col gap-2 animate-fade">
-            <div className="glass rounded-2xl px-4 py-2.5">
-              <div className="text-[10px] font-display tracking-[0.25em] text-cyan-300/70">СЧЁТ</div>
-              <div className="font-display text-3xl font-800 leading-none text-white" style={{ fontWeight: 800 }}>
-                {hud.dist + hud.coins * 25}
-              </div>
+      <div className="relative mx-auto max-w-[1100px] px-4 sm:px-6 py-6 sm:py-8">
+        {/* Header */}
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <div className="h-11 w-11 rounded-2xl bg-gradient-to-br from-cyan-400 to-teal-500 flex items-center justify-center shadow-[0_0_24px_rgba(45,212,191,0.4)]">
+              <span className="text-[22px]">◈</span>
             </div>
-            <div className="glass rounded-2xl px-4 py-2 flex items-center gap-2">
-              <Coins size={16} className="text-amber-300" />
-              <span className="font-display text-lg text-amber-200" style={{ fontWeight: 600 }}>{hud.coins}</span>
-            </div>
-            <div className="glass rounded-2xl px-4 py-2 flex items-center gap-2">
-              <LocIcon size={16} style={{ color: css(locCfg.accent) }} />
-              <span className="font-russo text-xs text-white/85 tracking-wide">{locCfg.name}</span>
-            </div>
-          </div>
-
-          <div className="absolute right-3 top-3 flex flex-col items-end gap-2 animate-fade">
-            <div className="flex gap-2">
-              <button
-                onClick={() => gameRef.current?.togglePause()}
-                className="glass rounded-full p-3 text-white/90 active:scale-90 transition-transform"
-                aria-label="Пауза"
-              >
-                {paused ? <Play size={20} /> : <Pause size={20} />}
-              </button>
-              <button
-                onClick={toggleMute}
-                className="glass rounded-full p-3 text-white/90 active:scale-90 transition-transform"
-                aria-label="Звук"
-              >
-                {muted ? <VolumeX size={20} /> : <Volume2 size={20} />}
-              </button>
-            </div>
-            <div className="pointer-events-none glass rounded-2xl px-4 py-2 flex items-center gap-2">
-              <Gauge size={16} className="text-cyan-300" />
-              <span className="font-display text-base text-white/90" style={{ fontWeight: 600 }}>{hud.speed}</span>
-              <span className="text-[10px] text-white/50 font-russo">км/ч</span>
-            </div>
-          </div>
-
-          {/* предупреждение о встречке */}
-          {warn && (
-            <div key={warn.key} className="pointer-events-none absolute bottom-24 left-1/2 -translate-x-1/2 animate-warn">
-              <div className="flex items-center gap-3 rounded-2xl border-2 border-red-500 bg-red-950/80 px-5 py-3 backdrop-blur">
-                <AlertTriangle size={20} className="text-red-400" />
-                <span className="font-display text-lg text-red-200 tracking-widest" style={{ fontWeight: 800 }}>
-                  {warn.kind === 'train' ? 'ПОЕЗД!' : 'ДРАКОН!'}
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-[22px] font-extrabold tracking-tight">FLIPWAY</h1>
+                <span className="text-[10px] tracking-[0.18em] font-semibold px-2 py-1 rounded-full bg-white/10 border border-white/10">
+                  P2P PARSER
                 </span>
-                {warn.kind === 'train'
-                  ? <TrainFront size={22} className="text-red-300" />
-                  : <Flame size={22} className="text-orange-400" />}
+              </div>
+              <p className="text-[13px] leading-none text-white/55">Bybit · USDT/RUB · Bank Transfer · от 3-х лиц</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 text-[12px]">
+            <span className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-white/60">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" /> LIVE P2P
+            </span>
+            <a
+              href="https://www.bybit.com/fiat/trade/otc/?actionType=0&token=USDT&fiat=RUB&amount=5000"
+              target="_blank"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white text-black font-semibold hover:bg-white/90 transition"
+            >
+              Открыть Bybit P2P <ExternalLink size={14} />
+            </a>
+          </div>
+        </header>
+
+        {/* Control panel */}
+        <div className="mt-6 rounded-[20px] bg-white/[0.06] border border-white/10 backdrop-blur-xl overflow-hidden">
+          <div className="p-4 sm:p-5 flex flex-col gap-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-[15px] font-bold flex items-center gap-2">
+                  <Filter size={16} className="text-cyan-300" /> Фильтры
+                </h2>
+                <p className="text-[12.5px] text-white/55 mt-1 max-w-[640px]">
+                  Ищем <span className="text-white font-semibold">покупку USDT за RUB</span> · оплата{" "}
+                  <span className="text-white font-semibold">Bank Transfer</span> · лимит{" "}
+                  <span className="text-white font-semibold">ровно от 5 000 RUB</span> · в описании{" "}
+                  <span className="text-emerald-300 font-semibold">явно разрешено от 3-х лиц</span>. Если пусто — скип. Если есть
+                  суммы в тексте — покажем бейджами.
+                </p>
+              </div>
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-full bg-emerald-400/10 border border-emerald-400/20 text-emerald-300">
+                <ShieldCheck size={14} /> Безопасный фильтр по описанию
+              </div>
+            </div>
+
+            <div className="grid grid-cols-12 gap-3">
+              <div className="col-span-12 sm:col-span-5 lg:col-span-3">
+                <label className="text-[11px] tracking-widest font-semibold text-white/55">СУММА ПОКУПКИ</label>
+                <div className="mt-1.5 relative">
+                  <Banknote size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/40" />
+                  <input
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value.replace(/[^\d\s]/g, ""))}
+                    placeholder="5000"
+                    className="w-full h-11 pl-9 pr-12 rounded-xl bg-[#0f1320] border border-white/10 outline-none focus:border-cyan-400/40 text-[15px] font-semibold mono"
+                  />
+                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] font-bold text-white/50">RUB</span>
+                </div>
+                <div className="mt-1 text-[11px] text-white/40">Фильтруем только где min = {formatAmount(amount || "5000")} ₽</div>
+              </div>
+
+              <div className="col-span-12 sm:col-span-7 lg:col-span-5 grid grid-cols-3 gap-2 self-end">
+                {[
+                  { k: "USDT", v: "USDT", sub: "крипта" },
+                  { k: "RUB", v: "RUB", sub: "фиат" },
+                  { k: "BANK", v: "Bank Transfer", sub: "оплата" },
+                ].map((b) => (
+                  <div key={b.k} className="h-11 rounded-xl bg-[#0f1320] border border-white/10 flex flex-col justify-center px-3">
+                    <div className="text-[12px] font-extrabold leading-none">{b.v}</div>
+                    <div className="text-[10px] tracking-widest text-white/40 font-semibold">{b.sub.toUpperCase()}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="col-span-12 lg:col-span-4 flex items-end gap-2">
+                <button
+                  onClick={doSearch}
+                  disabled={loading}
+                  className="flex-1 h-11 rounded-xl bg-gradient-to-r from-cyan-400 to-teal-400 text-black font-extrabold text-[14px] tracking-wide flex items-center justify-center gap-2 hover:brightness-110 active:scale-[0.99] transition disabled:opacity-60"
+                >
+                  {loading ? <RefreshCw size={18} className="animate-spin" /> : <Search size={18} />}
+                  {loading ? "ИЩЕМ..." : "НАЙТИ ПРЕДЛОЖЕНИЯ"}
+                </button>
+                <button
+                  onClick={() => setShowDebug((s) => !s)}
+                  className="h-11 w-11 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center hover:bg-white/10 transition"
+                  title="Отладка"
+                >
+                  <ChevronDown size={18} className={`transition ${showDebug ? "rotate-180" : ""}`} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-[11.5px]">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/[0.06] border border-white/10 text-white/70">
+                <ArrowUpDown size={12} /> Сортировка: от меньшей цены к большей
+              </span>
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-400/10 border border-amber-400/20 text-amber-200">
+                <Timer size={12} /> Банк: Bank Transfer
+              </span>
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-violet-400/10 border border-violet-400/20 text-violet-200">
+                <MessageSquareText size={12} /> Пустое описание = скип
+              </span>
+            </div>
+          </div>
+
+          {showDebug && (
+            <div className="border-t border-white/10 bg-black/20 p-4">
+              <div className="text-[11px] tracking-widest font-bold text-white/50">ОТЛАДКА / ЛОГИ</div>
+              <div className="mt-2 grid sm:grid-cols-2 gap-3">
+                <div className="rounded-xl bg-[#0f1320] border border-white/10 p-3">
+                  <div className="text-[12px] font-bold">Параметры запроса</div>
+                  <div className="mono text-[12px] text-white/70 mt-1">
+                    token=USDT · fiat=RUB · amount={amount} · side=0 (buy) · size=20
+                  </div>
+                  <div className="text-[11px] text-white/40 mt-2">
+                    Endpoint: api2.bybit.com/fiat/otc/item/online → fallback x-api + corsproxy
+                  </div>
+                </div>
+                <div className="rounded-xl bg-[#0f1320] border border-white/10 p-3">
+                  <div className="text-[12px] font-bold">Лог запросов</div>
+                  <div className="mono text-[11px] text-white/60 mt-1 max-h-28 overflow-auto whitespace-pre-wrap">
+                    {debug.length ? debug.join("\n") : "— нажми Найти —"}
+                  </div>
+                </div>
               </div>
             </div>
           )}
-        </>
-      )}
-
-      {/* баннер (смена локации и т.п.) */}
-      {banner && state === 'play' && (
-        <div key={banner.key} className="pointer-events-none absolute left-1/2 top-[16%] -translate-x-1/2 animate-banner w-full px-4">
-          <div className="mx-auto flex max-w-xl flex-col items-center text-center">
-            <div
-              className="font-display text-2xl sm:text-4xl tracking-wide text-white"
-              style={{ fontWeight: 900, textShadow: `0 0 24px ${banner.c}, 0 2px 12px rgba(0,0,0,.6)` }}
-            >
-              {banner.t}
-            </div>
-            <div className="mt-1.5 h-[3px] w-40 rounded-full" style={{ background: banner.c, boxShadow: `0 0 14px ${banner.c}` }} />
-            <div className="mt-2 font-russo text-sm sm:text-base text-white/85" style={{ textShadow: '0 1px 8px rgba(0,0,0,.8)' }}>
-              {banner.s}
-            </div>
-          </div>
         </div>
-      )}
 
-      {/* ═══ МЕНЮ ═══ */}
-      {state === 'menu' && (
-        <div
-          className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-b from-[#04060d]/60 via-transparent to-[#04060d]/90 px-4"
-          onPointerDown={(e) => { if (e.target === e.currentTarget) start(); }}
-        >
-          <div className="flex flex-col items-center animate-pop">
-            <div className="mb-3 flex items-center gap-2 rounded-full glass px-4 py-1.5">
-              <span className="h-2 w-2 rounded-full bg-cyan-400 animate-pulse-dot" />
-              <span className="font-russo text-[11px] tracking-[0.3em] text-cyan-200/80">WEBGL · БЕСКОНЕЧНЫЙ РАННЕР</span>
+        {/* Stats */}
+        {(results.length > 0 || rawCount > 0) && (
+          <div className="mt-4 grid grid-cols-12 gap-3">
+            <div className="col-span-12 sm:col-span-5 lg:col-span-3 rounded-2xl bg-white/[0.06] border border-white/10 p-3.5 flex items-center justify-between">
+              <div>
+                <div className="text-[11px] tracking-widest font-bold text-white/45">НАЙДЕНО ПОДХОДЯЩИХ</div>
+                <div className="text-[22px] font-extrabold leading-none mt-1">{results.length}</div>
+                <div className="text-[11px] text-white/45">из {rawCount} проверенных</div>
+              </div>
+              <div className="h-10 w-10 rounded-xl bg-emerald-400/15 border border-emerald-400/20 flex items-center justify-center text-emerald-300">
+                <CheckCircle2 size={18} />
+              </div>
             </div>
-            <h1
-              className="title-sheen font-display text-center leading-none text-glow-cyan"
-              style={{
-                fontWeight: 900,
-                fontSize: 'clamp(2.6rem, 9vw, 5.5rem)',
-                backgroundImage: 'linear-gradient(100deg,#22e0ff 10%,#7cf7ff 30%,#ff2d95 55%,#ff7ab8 75%,#22e0ff 95%)',
-                WebkitBackgroundClip: 'text',
-                backgroundClip: 'text',
-                color: 'transparent',
-              }}
-            >
-              ГРАВИ-РАН
-            </h1>
-            <p className="mt-3 max-w-md text-center font-russo text-sm sm:text-base text-white/75">
-              Жми на экран — и гравитация перевернётся: бегай по потолку!
-              Уворачивайся от поездов, мопсов и драконов в 5 мирах.
-            </p>
-          </div>
-
-          <div className="mt-6 grid w-full max-w-md grid-cols-3 gap-2 animate-pop" style={{ animationDelay: '.08s' }}>
-            {(Object.keys(LOCS) as LocId[]).map((id) => {
-              const I = LOC_ICONS[id];
-              return (
-                <div key={id} className="glass rounded-xl px-2 py-2.5 flex flex-col items-center gap-1">
-                  <I size={18} style={{ color: css(LOCS[id].accent) }} />
-                  <span className="font-russo text-[9px] sm:text-[10px] text-white/75 text-center leading-tight">{LOCS[id].name}</span>
+            <div className="col-span-12 sm:col-span-7 lg:col-span-5 rounded-2xl bg-white/[0.06] border border-white/10 p-3.5">
+              <div className="text-[11px] tracking-widest font-bold text-white/45">ЦЕНЫ (RUB за USDT)</div>
+              {stats ? (
+                <div className="mt-1 flex items-baseline gap-3 flex-wrap">
+                  <div className="text-[13px] font-bold">
+                    от <span className="mono text-emerald-300">{stats.min.toFixed(2)}</span> ₽
+                  </div>
+                  <div className="text-[13px] font-bold">
+                    до <span className="mono text-white">{stats.max.toFixed(2)}</span> ₽
+                  </div>
+                  <div className="text-[11px] text-white/50">
+                    средн <span className="mono">{stats.avg.toFixed(2)}</span>
+                  </div>
                 </div>
-              );
-            })}
-            <div className="glass rounded-xl px-2 py-2.5 flex flex-col items-center gap-1">
-              <ArrowUpDown size={18} className="text-cyan-300" />
-              <span className="font-russo text-[9px] sm:text-[10px] text-white/75 text-center leading-tight">ПОЛ + ПОТОЛОК</span>
+              ) : (
+                <div className="text-sm text-white/40 mt-1">—</div>
+              )}
+              <div className="text-[11px] text-white/40 mt-1 flex items-center gap-1">
+                <Info size={11} /> Сортировка от дешевых к дорогим — лучшие сверху
+              </div>
+            </div>
+            <div className="hidden lg:flex col-span-4 rounded-2xl bg-gradient-to-br from-cyan-500/15 to-teal-500/15 border border-cyan-400/20 p-3.5 items-center gap-3">
+              <div className="h-10 w-10 rounded-xl bg-white text-black flex items-center justify-center">
+                <Sparkles size={18} />
+              </div>
+              <div>
+                <div className="text-[12px] font-extrabold">Только «от 3 лиц»</div>
+                <div className="text-[11px] text-white/60">Пустые описания отфильтрованы</div>
+              </div>
             </div>
           </div>
+        )}
 
-          <div className="mt-4 flex w-full max-w-md items-stretch gap-2 animate-pop" style={{ animationDelay: '.14s' }}>
-            <div className="glass rounded-xl px-4 py-3 flex-1 flex items-center gap-3">
-              <MoveHorizontal size={22} className="text-fuchsia-400 shrink-0" />
-              <span className="font-russo text-[11px] text-white/80 leading-snug">Свайпы или ← → — смена дорожки</span>
-            </div>
-            <div className="glass rounded-xl px-4 py-3 flex-1 flex items-center gap-3">
-              <ArrowUpDown size={22} className="text-cyan-300 shrink-0" />
-              <span className="font-russo text-[11px] text-white/80 leading-snug">Тап или Пробел — сальто на потолок</span>
-            </div>
+        {/* Error/info */}
+        {error && (
+          <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-3.5 flex gap-3">
+            <AlertTriangle size={18} className="text-amber-300 shrink-0 mt-0.5" />
+            <div className="text-[13px] leading-5 text-amber-100/90">{error}</div>
           </div>
+        )}
 
-          <button
-            onClick={start}
-            className="group mt-7 flex items-center gap-3 rounded-full px-10 py-4 font-display text-xl tracking-widest text-white shadow-[0_0_40px_rgba(34,224,255,.45)] transition-transform active:scale-95 animate-pop"
-            style={{
-              fontWeight: 800,
-              background: 'linear-gradient(100deg,#0891b2,#22d3ee 45%,#e11d8f)',
-              animationDelay: '.2s',
-            }}
-          >
-            <Play size={24} className="transition-transform group-hover:scale-125" />
-            ИГРАТЬ
-          </button>
-
-          {hud.best > 0 && (
-            <div className="mt-4 flex items-center gap-2 glass rounded-full px-5 py-2 animate-fade">
-              <Trophy size={15} className="text-amber-300" />
-              <span className="font-russo text-sm text-amber-200">Рекорд: {hud.best}</span>
+        {/* Results */}
+        <div className="mt-5">
+          {!results.length && !loading && !error && (
+            <div className="rounded-[20px] bg-white/[0.03] border border-white/10 p-8 sm:p-10 text-center">
+              <div className="mx-auto h-12 w-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center">
+                <Search size={20} className="text-white/60" />
+              </div>
+              <div className="mt-3 text-[15px] font-bold">Готов к поиску</div>
+              <div className="mt-1 text-[13px] text-white/55 max-w-[560px] mx-auto">
+                Нажми <span className="text-white font-semibold">«Найти предложения»</span> — парсер запросит Bybit P2P напрямую из
+                твоего браузера, отфильтрует по Bank Transfer, лимиту ровно {formatAmount(amount || "5000")} ₽ и тексту «от 3 лиц»,
+                и отсортирует от меньшей цены.
+              </div>
+              <div className="mt-4 inline-flex items-center gap-2 text-[11px] px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-white/50">
+                <ShieldCheck size={12} /> Работает на сайте по кнопке — без сервера
+              </div>
             </div>
           )}
 
-          <p className="pointer-events-none absolute bottom-4 left-1/2 w-full -translate-x-1/2 text-center font-russo text-[10px] tracking-widest text-white/35 px-4">
-            3D НА OPENGL (WEBGL) · РАБОТАЕТ НА ТЕЛЕФОНЕ И ПК · МОЖНО СОБРАТЬ В APK
-          </p>
-        </div>
-      )}
+          {loading && (
+            <div className="grid gap-3">
+              {[1, 2, 3].map((i) => (
+                <div key={i} className="rounded-2xl bg-white/[0.04] border border-white/10 p-4 animate-pulse">
+                  <div className="h-4 w-32 bg-white/10 rounded" />
+                  <div className="mt-3 h-3 w-full bg-white/5 rounded" />
+                  <div className="mt-2 h-3 w-2/3 bg-white/5 rounded" />
+                </div>
+              ))}
+              <div className="text-center text-[12px] text-white/50">Запрашиваем Bybit P2P… может занять 3–7 сек</div>
+            </div>
+          )}
 
-      {/* ═══ ПАУЗА ═══ */}
-      {paused && state === 'play' && (
-        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm animate-fade">
-          <div className="font-display text-3xl text-white tracking-widest mb-6" style={{ fontWeight: 800 }}>ПАУЗА</div>
-          <div className="flex gap-3">
-            <button
-              onClick={() => gameRef.current?.togglePause()}
-              className="flex items-center gap-2 rounded-full bg-cyan-500 px-7 py-3.5 font-display text-base text-white active:scale-95 transition-transform"
-              style={{ fontWeight: 700 }}
-            >
-              <Play size={19} /> ДАЛЬШЕ
-            </button>
-            <button
-              onClick={() => { gameRef.current?.togglePause(); toMenu(); }}
-              className="flex items-center gap-2 rounded-full glass px-7 py-3.5 font-display text-base text-white/90 active:scale-95 transition-transform"
-              style={{ fontWeight: 700 }}
-            >
-              <Home size={19} /> МЕНЮ
-            </button>
-          </div>
-        </div>
-      )}
+          {!!results.length && (
+            <div className="grid gap-3">
+              <div className="text-[11px] tracking-widest font-bold text-white/45 px-1">
+                РЕЗУЛЬТАТЫ — {results.length} · ОТ ДЕШЕВЫХ К ДОРОГИМ
+              </div>
+              {results.map((it) => (
+                <div
+                  key={it.id}
+                  className="group rounded-[18px] bg-white/[0.06] border border-white/10 backdrop-blur hover:bg-white/[0.08] hover:border-white/15 transition overflow-hidden"
+                >
+                  <div className="p-4 sm:p-4.5 flex flex-col gap-3">
+                    {/* top row: price + limits + merchant */}
+                    <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+                      <div className="flex gap-3">
+                        <div className="shrink-0">
+                          <div className="text-[11px] tracking-widest font-bold text-white/45">ЦЕНА</div>
+                          <div className="flex items-baseline gap-1.5">
+                            <span className="text-[22px] font-extrabold mono leading-none">{Number(it.price).toFixed(2)}</span>
+                            <span className="text-[12px] font-bold text-white/60">₽</span>
+                            <span className="text-[11px] text-white/40">/ USDT</span>
+                          </div>
+                          <div className="mt-1 inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-full bg-white/5 border border-white/10 mono">
+                            <Wallet size={11} /> {formatAmount(it.minAmount)} – {formatAmount(it.maxAmount)} RUB
+                          </div>
+                        </div>
 
-      {/* ═══ СМЕРТЬ ═══ */}
-      {state === 'dead' && results && (
-        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-gradient-to-b from-red-950/50 via-[#04060d]/80 to-[#04060d]/95 px-4">
-          <div className="animate-pop flex flex-col items-center">
-            <div className="font-display text-4xl sm:text-5xl text-red-400 tracking-wider" style={{ fontWeight: 900, textShadow: '0 0 30px rgba(255,48,64,.5)' }}>
-              АВАРИЯ!
-            </div>
-            {results.isRecord && (
-              <div className="mt-3 flex items-center gap-2 rounded-full bg-amber-400/15 border border-amber-300/40 px-4 py-1.5">
-                <Trophy size={15} className="text-amber-300" />
-                <span className="font-russo text-xs text-amber-200 tracking-widest">НОВЫЙ РЕКОРД!</span>
-              </div>
-            )}
-            <div className="mt-6 glass rounded-3xl px-8 py-5 flex flex-col items-center min-w-[260px]">
-              <div className="text-[10px] font-display tracking-[0.3em] text-white/50">ИТОГОВЫЙ СЧЁТ</div>
-              <div className="font-display text-5xl text-white mt-1" style={{ fontWeight: 900 }}>{results.score}</div>
-              <div className="mt-3 flex items-center gap-5">
-                <div className="flex items-center gap-1.5 text-white/80">
-                  <ChevronRight size={14} className="text-cyan-300" />
-                  <span className="font-russo text-sm">{results.dist} м</span>
+                        <div className="hidden sm:block w-px bg-white/10 self-stretch mx-1" />
+
+                        <div className="min-w-0">
+                          <div className="text-[11px] tracking-widest font-bold text-white/45">МЕРЧАНТ</div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center font-extrabold text-[12px]">
+                              {it.nickName.slice(0, 1).toUpperCase()}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-[13px] font-bold leading-none flex items-center gap-1.5">
+                                <span className="truncate max-w-[160px] sm:max-w-[200px]">{it.nickName}</span>
+                                {it.isAuthMaker && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-sky-400/15 border border-sky-400/20 text-sky-300 text-[10px] font-bold">
+                                    <BadgeCheck size={10} /> Вериф
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2 mt-1 text-[11px] text-white/55">
+                                <span className="inline-flex items-center gap-1">
+                                  <User size={11} /> {it.finishedNum ?? it.recentOrderNum ?? "—"} ордеров
+                                </span>
+                                <span className="hidden sm:inline">·</span>
+                                <span className="inline-flex items-center gap-1 text-emerald-300">
+                                  <CheckCircle2 size={11} />{" "}
+                                  {it.completedRate
+                                    ? `${Number(it.completedRate).toFixed(0)}%`
+                                    : it.recentExecuteRate
+                                      ? `${Number(it.recentExecuteRate).toFixed(0)}%`
+                                      : "—"}{" "}
+                                  выполн.
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {it.payments.slice(0, 4).map((p, idx) => (
+                              <span
+                                key={idx}
+                                className="text-[10px] font-bold tracking-wide px-2 py-1 rounded-full bg-emerald-400/10 border border-emerald-400/20 text-emerald-200"
+                              >
+                                {p}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex lg:flex-col gap-2">
+                        <a
+                          href={`https://www.bybit.com/fiat/trade/otc/maker/${it.userId}?actionType=0&token=USDT&fiat=RUB&amount=${amount}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="flex-1 lg:flex-none inline-flex items-center justify-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-extrabold text-[13px] hover:bg-white/90 transition"
+                        >
+                          Открыть на Bybit <ExternalLink size={14} />
+                        </a>
+                        <button
+                          onClick={() => copyLink(it)}
+                          className="h-10 px-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition inline-flex items-center gap-1.5 text-[12px] font-semibold"
+                        >
+                          <Copy size={14} /> {copiedId === it.id ? "Скопировано" : "Ссылка"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* amounts badge */}
+                    {it.filter.extractedAmounts.length > 0 && (
+                      <div className="rounded-xl bg-amber-400/10 border border-amber-400/20 px-3 py-2 flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-[11px] font-extrabold tracking-widest text-amber-200">
+                          <AlertTriangle size={12} /> ТОЛЬКО НА СУММЫ:
+                        </span>
+                        <span className="flex flex-wrap gap-1.5">
+                          {it.filter.extractedAmounts.map((a) => (
+                            <span
+                              key={a}
+                              className="mono text-[12px] font-bold px-2 py-1 rounded-full bg-amber-400 text-black"
+                            >
+                              {a} ₽
+                            </span>
+                          ))}
+                        </span>
+                        <span className="text-[11px] text-amber-200/70">вытащено из описания</span>
+                      </div>
+                    )}
+
+                    {/* remark */}
+                    <div className="rounded-xl bg-[#0f1320] border border-white/10 p-3">
+                      <div className="flex items-center gap-2 text-[11px] tracking-widest font-bold text-white/45">
+                        <MessageSquareText size={12} /> ОПИСАНИЕ МЕРЧАНТА
+                        <span className="ml-auto inline-flex items-center gap-1.5 text-[11px] font-semibold px-2 py-1 rounded-full bg-emerald-400/10 border border-emerald-400/20 text-emerald-200">
+                          <CheckCircle2 size={11} /> {it.filter.reason}
+                        </span>
+                      </div>
+                      <div className="mt-2 text-[13px] leading-5 text-white/85 whitespace-pre-wrap break-words">
+                        {it.remark || "—"}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {it.filter.positiveFound.map((t) => (
+                          <span
+                            key={t}
+                            className="text-[10px] font-bold px-2 py-1 rounded-full bg-emerald-400/15 border border-emerald-400/20 text-emerald-200"
+                          >
+                            ✓ {t}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-[11px] text-white/40">
+                      <span className="mono">ID: {it.id.slice(0, 12)}…</span>
+                      <span>·</span>
+                      <span>Лимит: {formatAmount(it.minAmount)}–{formatAmount(it.maxAmount)} ₽</span>
+                    </div>
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5 text-white/80">
-                  <Coins size={14} className="text-amber-300" />
-                  <span className="font-russo text-sm">{results.coins}</span>
-                </div>
-                <div className="flex items-center gap-1.5 text-white/80">
-                  <Trophy size={14} className="text-amber-400" />
-                  <span className="font-russo text-sm">{results.best}</span>
-                </div>
-              </div>
+              ))}
             </div>
-            <div className="mt-7 flex gap-3">
-              <button
-                onClick={start}
-                className="flex items-center gap-3 rounded-full px-8 py-4 font-display text-lg text-white shadow-[0_0_34px_rgba(34,224,255,.4)] active:scale-95 transition-transform"
-                style={{ fontWeight: 800, background: 'linear-gradient(100deg,#0891b2,#22d3ee 45%,#e11d8f)' }}
-              >
-                <RotateCcw size={22} />
-                ЕЩЁ РАЗ
-              </button>
-              <button
-                onClick={toMenu}
-                className="flex items-center gap-2 rounded-full glass px-6 py-4 font-display text-base text-white/90 active:scale-95 transition-transform"
-                style={{ fontWeight: 700 }}
-              >
-                <Home size={19} />
-              </button>
-            </div>
-          </div>
+          )}
         </div>
-      )}
+
+        <footer className="mt-8 rounded-2xl bg-white/[0.03] border border-white/10 p-4 flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
+          <div className="text-[12px] text-white/55">
+            Flipway — парсер Bybit P2P · фильтрует только лимиты <b className="text-white">ровно от {formatAmount(amount || "5000")} ₽</b>,
+            Bank Transfer и явные упоминания о 3-х лицах. Сортировка по цене.
+          </div>
+          <div className="text-[11px] text-white/30">Не является финансовым советом. Проверяй мерчанта на Bybit.</div>
+        </footer>
+      </div>
     </div>
   );
 }
