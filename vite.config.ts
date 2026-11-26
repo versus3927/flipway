@@ -9,31 +9,27 @@ const __dirname = path.dirname(__filename);
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
-    },
-  },
+  resolve: { alias: { "@": path.resolve(__dirname, "src") } },
   server: {
     host: "0.0.0.0",
     port: 5173,
     cors: true,
-    hmr: { host: "5173-izch8f196v00p0gnznnac.e2b.app", protocol: "https" as const },
     allowedHosts: true as any,
-    headers: { "X-Frame-Options": "ALLOWALL" },
     proxy: {
+      "/api": {
+        target: "http://localhost:3000",
+        changeOrigin: true,
+      },
       "/bybit-api": {
         target: "https://api2.bybit.com",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/bybit-api/, ""),
         secure: false,
       },
-      "/bybit-x-api": {
-        target: "https://www.bybit.com",
-        changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/bybit-x-api/, ""),
-        secure: false,
-      },
     },
+  },
+  preview: {
+    host: "0.0.0.0",
+    port: 4173,
   },
 });

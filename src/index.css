@@ -3,7 +3,11 @@
 * { font-family: "Manrope", sans-serif; }
 .mono { font-family: "JetBrains Mono", monospace; }
 
+/* Bybit black scrollbar */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: #0f1424; }
-::-webkit-scrollbar-thumb { background: #24304d; border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: #34456e; }
+::-webkit-scrollbar-track { background: #0B0E11; }
+::-webkit-scrollbar-thumb { background: #2B3139; }
+::-webkit-scrollbar-thumb:hover { background: #474D57; }
+
+/* Force sharp corners everywhere - override tailwind rounded */
+* { border-radius: 0 !important; }
