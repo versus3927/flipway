@@ -12,87 +12,116 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Proxy endpoint for Bybit P2P
+// Detailed logging
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+// Proxy endpoint for Bybit P2P - matches working p2p-monitor payload
 app.post("/api/bybit/p2p", async (req, res) => {
   try {
     const body = req.body || {};
-    // Default body handling - ensure required fields
+    // p2p-monitor uses empty amount to fetch all ads, then client filters by min/max
+    // Also side mapping: SELL (merchant sells, user buys) = "1", BUY = "0"
     const payload = {
-      userId: body.userId ?? "",
+      userId: "",
       tokenId: body.tokenId || "USDT",
       currencyId: body.currencyId || "RUB",
-      payment: body.payment ?? [],
-      side: body.side ?? "0",
-      size: body.size ?? "20",
-      page: body.page ?? "1",
-      amount: body.amount ?? "5000",
+      payment: [],
+      side: body.side ?? "1", // default to 1 = user buys USDT
+      size: String(body.size ?? "20"),
+      page: String(body.page ?? "1"),
+      amount: "", // send empty to get all, like p2p-monitor does - client will filter by min=5000
       authMaker: false,
       canTrade: false,
-      ...body,
     };
+    // If caller explicitly wants amount filter, allow override with body.amount if not empty
+    // But we prioritize empty to maximize results; frontend will filter strictly by min=5000
+    // To support both, we try with empty first, if 0 results then try with amount
+    const payloadsToTry = [payload];
+    if (body.amount && body.amount !== "") {
+      payloadsToTry.push({ ...payload, amount: String(body.amount) });
+    }
 
-    // Try primary endpoint
     const endpoints = [
       "https://api2.bybit.com/fiat/otc/item/online",
       "https://www.bybit.com/x-api/fiat/otc/item/list",
     ];
 
     let lastError = null;
-    for (const url of endpoints) {
-      try {
-        const r = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "https://www.bybit.com/",
-            Origin: "https://www.bybit.com",
-            lang: "ru",
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(8000),
-        });
-        const text = await r.text();
-        let json;
+    let lastJson = null;
+
+    for (const tryPayload of payloadsToTry) {
+      for (const url of endpoints) {
         try {
-          json = JSON.parse(text);
-        } catch {
-          lastError = `Non-JSON from ${url}: ${text.slice(0, 500)}`;
-          continue;
+          log(`→ ${url} payload=${JSON.stringify(tryPayload)}`);
+          const r = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              Referer: "https://www.bybit.com/fiat/trade/otc/",
+              Origin: "https://www.bybit.com",
+              lang: "ru",
+              "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            },
+            body: JSON.stringify(tryPayload),
+            signal: AbortSignal.timeout(10000),
+          });
+          const text = await r.text();
+          let json;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            lastError = `Non-JSON ${url}: ${text.slice(0, 500)}`;
+            log(lastError);
+            continue;
+          }
+          log(`← ${url} status=${r.status} ret_code=${json.ret_code} items=${json?.result?.items?.length ?? "?"}`);
+          if (r.ok && json.ret_code === 0) {
+            const items = json?.result?.items ?? [];
+            // If we got results, return immediately
+            if (items.length > 0) {
+              log(`✓ returning ${items.length} items from ${url}`);
+              return res.json(json);
+            }
+            // Remember empty result but continue trying other payload/endpoint
+            lastJson = json;
+            lastError = `empty from ${url} with payload amount='${tryPayload.amount}'`;
+          } else {
+            lastError = `HTTP ${r.status} ${url}: ${json.ret_msg || text.slice(0, 500)}`;
+            log(lastError);
+            lastJson = json;
+          }
+        } catch (e) {
+          lastError = `${url} error: ${e.message}`;
+          log(lastError);
         }
-        if (r.ok) {
-          // log success
-          // Add CORS headers already via cors middleware
-          return res.json(json);
-        } else {
-          lastError = `HTTP ${r.status} from ${url}: ${text.slice(0, 500)}`;
-        }
-      } catch (e) {
-        lastError = `${url} error: ${e.message}`;
       }
     }
 
-    // If both failed, return error but with 200 and empty items to let frontend fallback
+    // If all tried but got at least one response (even empty), return it so frontend can show debug
+    if (lastJson) {
+      return res.json(lastJson);
+    }
     res.status(502).json({ error: "Bybit API failed", details: lastError });
   } catch (e) {
+    log("server error", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Health
 app.get("/api/health", (_, res) => res.json({ ok: true }));
 
-// Serve static dist
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 
-// SPA fallback - express 5 needs named wildcard
 app.get("/*splat", (req, res) => {
   if (req.path.startsWith("/api/")) return res.status(404).json({ error: "not found" });
   res.sendFile(path.join(distPath, "index.html"));
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Flipway server listening on ${PORT}`);
+  log(`Flipway server listening on ${PORT}`);
 });

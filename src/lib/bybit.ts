@@ -81,18 +81,8 @@ async function fetchViaServer(payload: any): Promise<any> {
   });
   if (!r.ok) {
     const t = await r.text();
-    throw new Error(`Server proxy ${r.status}: ${t.slice(0, 300)}`);
+    throw new Error(`Server proxy ${r.status}: ${t.slice(0, 500)}`);
   }
-  return r.json();
-}
-
-async function fetchDirect(payload: any, url: string): Promise<any> {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
@@ -106,68 +96,47 @@ export async function fetchBybitP2P(options: {
 }): Promise<{ items: BybitItem[]; rawCount: number; debug: string[] }> {
   const tokenId = options.tokenId || "USDT";
   const currencyId = options.currencyId || "RUB";
-  const side = options.side ?? 0;
+  // Correct side: user BUY USDT => merchant SELL => side "1"
+  // Previously we sent "0" which is opposite side (merchant BUY)
+  const side = options.side ?? 1;
   const pageSize = options.pageSize ?? 20;
   const maxPages = options.maxPages ?? 5;
 
   const debug: string[] = [];
   const allItems: BybitItem[] = [];
 
+  // Use same logic as p2p-monitor: send amount="" to get all ads, filter client-side
+  // But also pass original amount for server to try both variants
   for (let page = 1; page <= maxPages; page++) {
     const payload = {
-      userId: "",
       tokenId,
       currencyId,
       payment: [],
       side: String(side),
       size: String(pageSize),
       page: String(page),
-      amount: options.amount,
-      authMaker: false,
-      canTrade: false,
+      amount: options.amount, // server will try empty + this
     };
 
     let json: any = null;
-    let success = false;
-
-    // 1) Try server proxy (works on Railway)
     try {
-      debug.push(`стр ${page}: через сервер /api/bybit/p2p`);
+      debug.push(`стр ${page}: через сервер /api/bybit/p2p (side=${side}, amount='${options.amount}' → сервер попробует пустой + filtered)`);
       json = await fetchViaServer(payload);
-      success = true;
-      debug.push(`  -> сервер OK`);
+      debug.push(`  → сервер OK ret_code=${json.ret_code}`);
     } catch (e: any) {
-      debug.push(`  -> сервер ошибка: ${e.message}`);
-      // 2) Try vite dev proxy (local)
-      try {
-        const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname.includes("e2b.app"));
-        if (isLocal) {
-          debug.push(`  пробую /bybit-api/fiat/otc/item/online (vite proxy)`);
-          json = await fetchDirect(payload, "/bybit-api/fiat/otc/item/online");
-          success = true;
-        } else throw new Error("not local");
-      } catch (e2: any) {
-        // 3) Try direct + public cors proxy as last resort
-        try {
-          debug.push(`  пробую прямой api2.bybit.com`);
-          json = await fetchDirect(payload, "https://api2.bybit.com/fiat/otc/item/online");
-          success = true;
-        } catch (e3: any) {
-          debug.push(`  -> все методы не сработали: ${e3.message}`);
-          continue;
-        }
-      }
+      debug.push(`  → сервер ошибка: ${e.message}`);
+      continue;
     }
 
-    if (!success || !json) continue;
-
-    const items = json?.result?.items ?? json?.result?.list ?? json?.data?.items ?? json?.data ?? json?.items ?? [];
+    const items = json?.result?.items ?? json?.result?.list ?? json?.data?.items ?? [];
     if (!Array.isArray(items)) {
-      debug.push(`  неожиданный формат: ${JSON.stringify(json).slice(0, 200)}`);
+      debug.push(`  неожиданный формат: ${JSON.stringify(json).slice(0, 300)}`);
       break;
     }
     if (items.length === 0) {
       debug.push(`  стр ${page}: 0 объявлений — конец`);
+      // If first page empty, break and report
+      if (page === 1) break;
       break;
     }
     for (const raw of items) {
@@ -179,7 +148,7 @@ export async function fetchBybitP2P(options: {
   }
 
   if (allItems.length === 0) {
-    debug.push("Ничего не нашли — проверь доступность Bybit.");
+    debug.push("Ничего не пришли — проверь доступность Bybit / side mapping.");
   }
 
   return { items: allItems, rawCount: allItems.length, debug };
